@@ -12,13 +12,14 @@
 2. SQL 复核：选择基准，编辑候选，校验后创建独立批次并入 Redis 队列。
 3. 运行历史：跟踪 queued/running/passed/different/failed，失败也保留证据。
 4. 证据详情：真实 EXPLAIN ANALYZE、两侧结果行、SHA-256 摘要、遗漏/新增行和 JSON 下载。
-5. 管理员操作审计：记录写请求、执行账号和 HTTP 结果，包括拒绝请求。
+5. 账单调号：账单号码登反了可成批调正。同批可互换号码，也能用上一张腾出的号，整批一次性切换；目标号被批外账单占用就整批退回并标出冲突号码。
+6. 管理员操作审计：记录写请求、执行账号和 HTTP 结果，包括拒绝请求。
 
 | 角色 | 主要页面 | 权限与典型动作 |
 |---|---|---|
-| admin 管理员 | 全部页面、审计 | 创建样本/批次、查看/导出结果、查看写操作审计 |
-| operator 操作员 | 四个业务页面 | 登记 SQL、提交后台复核、查看/导出结果；不可查看管理员审计 |
-| viewer 观察员 | 四个业务页面 | 只读与导出；API 层拒绝所有业务写请求 |
+| admin 管理员 | 全部页面、审计 | 创建样本/批次、办理调号、查看/导出结果、查看写操作审计 |
+| operator 操作员 | 五个业务页面 | 登记 SQL、提交后台复核、办理账单调号、查看/导出结果；不可查看管理员审计 |
+| viewer 观察员 | 五个业务页面 | 只读与导出；API 层拒绝所有业务写请求（含调号） |
 
 ## 快速启动
 
@@ -50,6 +51,15 @@ docker compose down -v --remove-orphans
 7. 09:30 下载 `review-<批次号>.json` 给结算复核人。
 8. 09:40 viewer 登录复核，API 创建样本返回 403；10:00 admin 查看审计。
 
+## 账单调号剧本
+
+1. 10:10 发现 101 与 202 两张账单号码登反，operator 打开“账单调号”。
+2. 点“填入互换示例”改为 `101,202` 与 `202,101` 两行，提交后整批生效，明细逐行显示“生效”。
+3. 链式调正：`103,104`、`104,105`、`105,961`，后一行用上一行腾出的号，最后一行落入新号，仍是一次性切换。
+4. 若目标号被批外账单占用（如 `106,107`），整批退回，页面标出冲突号码，其余明细标记“随批退回”，账单不变。
+5. 提交后若断线，保留同一幂等键重试：返回原批次结论，不重复调号；历史列表随时可查生效/冲突明细。
+6. 复核查询的原始与候选两侧在同一 REPEATABLE READ 快照读取，调号前后各自一致；已归档证据保留当时号码，不回改。
+
 ```sql
 SELECT customer, SUM(amount) AS total
 FROM invoices
@@ -63,7 +73,9 @@ ORDER BY customer
 
 输入是原始/候选单条 SELECT。sqlglot 解析 AST，仅准许 invoices 表、指定业务字段和 SUM/COUNT/AVG/MIN/MAX/ROUND/COALESCE/CAST。禁止多语句、INTO、锁、CTE、跨表、schema 和任意函数。解析后重新生成 PostgreSQL SQL，执行在 READ ONLY 事务中，切换 NOLOGIN `query_reader` 角色；该角色仅有 invoices 的 SELECT 权限。每条 statement 超时 2500ms，最多返回 1000 行，AST 最多 250 节点，候选 SQL 最多 6000 字符，最多 20 个排队/运行任务。
 
-两侧均实际执行 `EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS)` 与 SELECT。结果每行按列位置规范为数据库文本值，`Counter` 统计行的重复次数；列数相同且计数集合相同即 equivalent。忽略行顺序及列别名、保留重复行，NULL 保留为空值。按有序的“规范行/计数”生成 SHA-256。数值不同文本表示（如 1 与 1.0）会判不同；这是明确的保守口径。不能据固定数据集通过证明所有可能输入上的 SQL 语义等价；一次耗时不能证明优化收益。
+两侧均实际执行 `EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS)` 与 SELECT，且两侧在同一 REPEATABLE READ 只读事务的同一快照中运行；并发调号不会让两侧读到不同版本的号码。结果每行按列位置规范为数据库文本值，`Counter` 统计行的重复次数；列数相同且计数集合相同即 equivalent。忽略行顺序及列别名、保留重复行，NULL 保留为空值。按有序的“规范行/计数”生成 SHA-256。数值不同文本表示（如 1 与 1.0）会判不同；这是明确的保守口径。不能据固定数据集通过证明所有可能输入上的 SQL 语义等价；一次耗时不能证明优化收益。
+
+调号批次在一个数据库事务中执行：先按号码升序取 `pg_advisory_xact_lock`（只锁涉及号码，无关账单照常写），再把源号迁入临时负号占位、逐条落到新号，互换与链式都原子生效。目标号被批外账单占用（或源号已不存在）则整批退回，不改动任何账单；生效/退回结论与逐条明细都落库保存。幂等键唯一约束保证断线重试返回原结论而不重复调号；历史证据是写入时快照，调号不回改。
 
 失败态包括语法/白名单失败（提交前 422）、缺少样本（404）、重名（409）、任务配额（429）、数据库超时/运行错误（批次 failed，保存 error）。正常差异是 different，不当成异常。
 
@@ -77,7 +89,7 @@ ORDER BY customer
 | db / cache | PostgreSQL 16、Redis 7 |
 | auth | JWT 8 小时有效，PBKDF2 SHA-256 加盐密码 |
 
-`backend/src/` 按 config/models/schemas/services/controllers/routes/middlewares/utils/constants 分工；`backend/scripts/seed_demo.py` 管理幂等初始化；`backend/migrations/README.md` 说明 schema v1。`frontend/src/` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分工。实体链分别为 sample、batch、evidence，各自有模型、schema、服务、路由、API、store 和页面。
+`backend/src/` 按 config/models/schemas/services/controllers/routes/middlewares/utils/constants 分工；`backend/scripts/seed_demo.py` 管理幂等初始化；`backend/migrations/README.md` 说明 schema v1/v2。`frontend/src/` 按 api/stores/types/components/common/hooks/pages/router/utils/constants 分工。实体链分别为 sample、batch、evidence，另有独立的 renumber（调号批次）实体，各自有模型、schema、服务、路由、API、store 和页面。
 
 后端本地：创建虚拟环境并安装 `backend/requirements.txt`，先用 Compose 启动 db/redis，设置本地可达的 DATABASE_URL/REDIS_URL/JWT_SECRET，进入 backend 执行 `uvicorn src.main:app --reload`；worker 需 `/artifacts` 可写目录并执行 `python -m src.worker`。最省事的开发方式是修改源码后 `docker compose up -d --build`。前端通过 Nginx 的 `/api/` 去前缀代理访问后端，禁止双重 `/api/api`。
 
@@ -88,9 +100,10 @@ ORDER BY customer
 ## 已知边界
 
 - 小型工作流没有样本删除和版本编辑；新口径新建样本/批次，旧记录保持独立。
+- 调号按提交时的当前号码识别账单；批次落库后不重算，历史批次与证据保留当时号码。
 - 使用固定业务数据和单实例 worker；不对接生产数据库，不部署生产高可用。
 - 只允许受限 SQL 子集；不支持 CTE、窗口、跨表联接和用户自定义函数。
-- 查询会执行两次（一次 EXPLAIN ANALYZE，一次取结果）；数据源固定只读，避免两次间口径变化。
+- 每条查询会执行两次（一次 EXPLAIN ANALYZE，一次取结果）；两侧共用同一快照且数据源只读，避免两次间口径变化。
 - 后端迁移/seed 角色为本地数据库管理员；执行用户 SQL 时强制切换受限只读角色。生产应拆分独立迁移凭据。
 - Web 字体来自 Google Fonts，离线会使用 serif/monospace 回退；不影响功能。
 

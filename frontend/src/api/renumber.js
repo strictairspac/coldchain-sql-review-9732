@@ -1,0 +1,1 @@
+import{api,post}from'./client.js';export const listRenumberBatches=()=>api('/renumbers');export const getRenumberBatch=id=>api('/renumbers/'+id);export const createRenumberBatch=data=>post('/renumbers',data);

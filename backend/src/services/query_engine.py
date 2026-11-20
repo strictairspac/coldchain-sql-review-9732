@@ -21,21 +21,29 @@ def validate_sql(sql):
         if f.sql_name() not in ALLOWED_FUNCTIONS: raise ValueError('不允许函数：'+f.sql_name())
     if len(list(tree.walk()))>250: raise ValueError('SQL 结构过大')
     return tree.sql(dialect='postgres')
+def run_query(conn,sql):
+    plan=conn.execute(text('EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) '+sql)).scalar()
+    started=time.perf_counter()
+    cursor=conn.execute(text(sql)); columns=list(cursor.keys()); rows=cursor.fetchmany(1001)
+    if len(rows)>1000: raise ValueError('结果超过 1000 行，请聚合或 LIMIT')
+    rows=[[str(v) if v is not None else None for v in row] for row in rows]
+    return {'columns':columns,'rows':rows,'row_count':len(rows),'elapsed_ms':round((time.perf_counter()-started)*1000,3),'plan':plan}
+def begin_readonly(conn,isolation=None):
+    conn.execute(text('SET TRANSACTION ISOLATION LEVEL '+isolation+' READ ONLY' if isolation else 'SET TRANSACTION READ ONLY'))
+    conn.execute(text("SET LOCAL statement_timeout='2500ms'"))
+    conn.execute(text('SET LOCAL ROLE query_reader'))
 def execute_query(sql):
     sql=validate_sql(sql)
     with engine.connect() as conn:
         with conn.begin():
-            conn.execute(text('SET TRANSACTION READ ONLY'))
-            conn.execute(text("SET LOCAL statement_timeout='2500ms'"))
-            conn.execute(text('SET LOCAL ROLE query_reader'))
-            plan=conn.execute(text('EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) '+sql)).scalar()
-            started=time.perf_counter()
-            cursor=conn.execute(text(sql)); columns=list(cursor.keys()); rows=cursor.fetchmany(1001)
-            if len(rows)>1000: raise ValueError('结果超过 1000 行，请聚合或 LIMIT')
-            rows=[[str(v) if v is not None else None for v in row] for row in rows]
-            return {'columns':columns,'rows':rows,'row_count':len(rows),'elapsed_ms':round((time.perf_counter()-started)*1000,3),'plan':plan}
+            begin_readonly(conn)
+            return run_query(conn,sql)
 def compare(original,candidate):
-    left=execute_query(original);right=execute_query(candidate)
+    original=validate_sql(original);candidate=validate_sql(candidate)
+    with engine.connect() as conn:
+        with conn.begin():
+            begin_readonly(conn,'REPEATABLE READ')
+            left=run_query(conn,original);right=run_query(conn,candidate)
     canon=lambda data:Counter(json.dumps(row,ensure_ascii=False) for row in data['rows'])
     a,b=canon(left),canon(right)
     equivalent=len(left['columns'])==len(right['columns']) and a==b
